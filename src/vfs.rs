@@ -1,44 +1,40 @@
 //! A virtual file system layer that lets us define multiple
-//! "file systems" with various backing stores, then merge them 
+//! "file systems" with various backing stores, then merge them
 //! together.
 //!
-//! Basically a re-implementation of `PhysFS`.  The `vfs` crate
-//! does something similar but has a couple design decisions that make 
-//! it kind of incompatible with this use case;
-//!
-//! We make some simplifying assumptions as well, namely that
-//! Path == str.  Because doing defining all our paths to be 
-//! generic `T: Into<Path>` or such means that we can't use the
-//! resulting traits as trait objects.
+//! Basically a re-implementation of the C library `PhysFS`.  The
+//! `vfs` crate does something similar but has a couple design
+//! decisions that make it kind of incompatible with this use case:
+//! the relevant trait for it has generic methods so we can't use it
+//! as a trait object, and its path abstraction is not the most
+//! convenient.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::path::{self, PathBuf, Path};
-use std::fs;
 use std::fmt::{self, Debug};
-use std::io::{self, Read, Write, Seek};
+use std::fs;
+use std::io::{self, Read, Seek, Write};
+use std::path::{self, Path, PathBuf};
 
 use zip;
 
-use {GameResult, GameError};
+use crate::error::{GameError, GameResult};
 
 fn convenient_path_to_str(path: &path::Path) -> GameResult<&str> {
-    let errmessage = format!("Invalid path format for resource: {:?}", path);
-    let error = GameError::FilesystemError(errmessage);
-    path.to_str().ok_or(error)
+    path.to_str().ok_or_else(|| {
+        let errmessage = format!("Invalid path format for resource: {:?}", path);
+        GameError::FilesystemError(errmessage)
+    })
 }
-
-//pub type Path = str;
 
 pub trait VFile: Read + Write + Seek + Debug {}
 
 impl<T> VFile for T where T: Read + Write + Seek + Debug {}
 
-
 /// Options for opening files
 ///
 /// We need our own version of this structure because the one in
-/// std annoyingly doesn't let you get data out of it.
+/// `std` annoyingly doesn't let you get data out of it.
 #[derive(Debug, Default, Copy, Clone, PartialEq)]
 pub struct OpenOptions {
     read: bool,
@@ -86,7 +82,8 @@ impl OpenOptions {
 
     fn to_fs_openoptions(&self) -> fs::OpenOptions {
         let mut opt = fs::OpenOptions::new();
-        opt.read(self.read)
+        let _ = opt
+            .read(self.read)
             .write(self.write)
             .create(self.create)
             .append(self.append)
@@ -98,41 +95,42 @@ impl OpenOptions {
 
 pub trait VFS: Debug {
     /// Open the file at this path with the given options
-    fn open_options(&self, path: &Path, open_options: &OpenOptions) -> GameResult<Box<VFile>>;
+    fn open_options(&self, path: &Path, open_options: &OpenOptions) -> GameResult<Box<dyn VFile>>;
     /// Open the file at this path for reading
-    fn open(&self, path: &Path) -> GameResult<Box<VFile>> {
+    fn open(&self, path: &Path) -> GameResult<Box<dyn VFile>> {
         self.open_options(path, OpenOptions::new().read(true))
     }
     /// Open the file at this path for writing, truncating it if it exists already
-    fn create(&self, path: &Path) -> GameResult<Box<VFile>> {
-        self.open_options(path,
-                          OpenOptions::new()
-                              .write(true)
-                              .create(true)
-                              .truncate(true))
+    fn create(&self, path: &Path) -> GameResult<Box<dyn VFile>> {
+        self.open_options(
+            path,
+            OpenOptions::new().write(true).create(true).truncate(true),
+        )
     }
     /// Open the file at this path for appending, creating it if necessary
-    fn append(&self, path: &Path) -> GameResult<Box<VFile>> {
-        self.open_options(path,
-                          OpenOptions::new().write(true).create(true).append(true))
+    fn append(&self, path: &Path) -> GameResult<Box<dyn VFile>> {
+        self.open_options(
+            path,
+            OpenOptions::new().write(true).create(true).append(true),
+        )
     }
     /// Create a directory at the location by this path
-    fn mkdir(&self, path: &Path) -> GameResult<()>;
+    fn mkdir(&self, path: &Path) -> GameResult;
 
     /// Remove a file or an empty directory.
-    fn rm(&self, path: &Path) -> GameResult<()>;
+    fn rm(&self, path: &Path) -> GameResult;
 
     /// Remove a file or directory and all its contents
-    fn rmrf(&self, path: &Path) -> GameResult<()>;
+    fn rmrf(&self, path: &Path) -> GameResult;
 
     /// Check if the file exists
     fn exists(&self, path: &Path) -> bool;
 
     /// Get the file's metadata
-    fn metadata(&self, path: &Path) -> GameResult<Box<VMetadata>>;
+    fn metadata(&self, path: &Path) -> GameResult<Box<dyn VMetadata>>;
 
     /// Retrieve all file and directory entries in the given directory.
-    fn read_dir(&self, path: &Path) -> GameResult<Box<Iterator<Item = GameResult<PathBuf>>>>;
+    fn read_dir(&self, path: &Path) -> GameResult<Box<dyn Iterator<Item = GameResult<PathBuf>>>>;
 
     /// Retrieve the actual location of the VFS root, if available.
     fn to_path_buf(&self) -> Option<PathBuf>;
@@ -140,7 +138,8 @@ pub trait VFS: Debug {
 
 pub trait VMetadata {
     /// Returns whether or not it is a directory.
-    /// Note that zip files don't actually have directories, awkwardly.
+    /// Note that zip files don't actually have directories, awkwardly,
+    /// just files with very long names.
     fn is_dir(&self) -> bool;
     /// Returns whether or not it is a file.
     fn is_file(&self) -> bool;
@@ -150,9 +149,10 @@ pub trait VMetadata {
 }
 
 /// A VFS that points to a directory and uses it as the root of its
-/// file heirarchy.
+/// file hierarchy.
 ///
-/// It IS allowed to have symlinks in it!  For now.
+/// It IS allowed to have symlinks in it!  They're surprisingly
+/// difficult to get rid of.
 #[derive(Clone)]
 pub struct PhysicalFS {
     root: PathBuf,
@@ -173,7 +173,6 @@ impl VMetadata for PhysicalMetadata {
         self.0.len()
     }
 }
-
 
 /// This takes an absolute path and returns either a sanitized relative
 /// version of it, or None if there's something bad in it.
@@ -216,7 +215,7 @@ impl PhysicalFS {
     pub fn new(root: &Path, readonly: bool) -> Self {
         PhysicalFS {
             root: root.into(),
-            readonly: readonly,
+            readonly,
         }
     }
 
@@ -224,17 +223,31 @@ impl PhysicalFS {
     /// a new PathBuf containing the canonical
     /// absolute path you get when appending it
     /// to this filesystem's root.
-    fn get_absolute(&self, p: &Path) -> GameResult<PathBuf> {
-        //let p = path::Path::new(p);
+    fn to_absolute(&self, p: &Path) -> GameResult<PathBuf> {
         if let Some(safe_path) = sanitize_path(p) {
             let mut root_path = self.root.clone();
             root_path.push(safe_path);
             Ok(root_path)
         } else {
-            let msg = format!("Path {:?} is not valid: must be an absolute path with no \
-                               references to parent directories",
-                              p);
+            let msg = format!(
+                "Path {:?} is not valid: must be an absolute path with no \
+                 references to parent directories",
+                p
+            );
             Err(GameError::FilesystemError(msg))
+        }
+    }
+
+    /// Creates the PhysicalFS's root directory if necessary.
+    /// Idempotent.
+    /// This way we can not create the directory until it's
+    /// actually used, though it IS a tiny bit of a performance
+    /// malus.
+    fn create_root(&self) -> GameResult {
+        if !self.root.exists() {
+            fs::create_dir_all(&self.root).map_err(GameError::from)
+        } else {
+            Ok(())
         }
     }
 }
@@ -245,35 +258,41 @@ impl Debug for PhysicalFS {
     }
 }
 
-
 impl VFS for PhysicalFS {
     /// Open the file at this path with the given options
-    fn open_options(&self, path: &Path, open_options: &OpenOptions) -> GameResult<Box<VFile>> {
-        if self.readonly {
-            if open_options.write || open_options.create || open_options.append ||
-               open_options.truncate {
-                let msg = format!("Cannot alter file {:?} in root {:?}, filesystem read-only",
-                                  path,
-                                  self);
-                return Err(GameError::FilesystemError(msg));
-            }
+    fn open_options(&self, path: &Path, open_options: &OpenOptions) -> GameResult<Box<dyn VFile>> {
+        if self.readonly
+            && (open_options.write
+                || open_options.create
+                || open_options.append
+                || open_options.truncate)
+        {
+            let msg = format!(
+                "Cannot alter file {:?} in root {:?}, filesystem read-only",
+                path, self
+            );
+            return Err(GameError::FilesystemError(msg));
         }
-        let p = self.get_absolute(path)?;
+        self.create_root()?;
+        let p = self.to_absolute(path)?;
         open_options
             .to_fs_openoptions()
             .open(p)
-            .map(|x| Box::new(x) as Box<VFile>)
+            .map(|x| Box::new(x) as Box<dyn VFile>)
             .map_err(GameError::from)
     }
 
     /// Create a directory at the location by this path
-    fn mkdir(&self, path: &Path) -> GameResult<()> {
+    fn mkdir(&self, path: &Path) -> GameResult {
         if self.readonly {
-            return Err(GameError::FilesystemError("Tried to make directory {} but FS is \
-                                                   read-only"
-                                                          .to_string()));
+            return Err(GameError::FilesystemError(
+                "Tried to make directory {} but FS is \
+                 read-only"
+                    .to_string(),
+            ));
         }
-        let p = self.get_absolute(path)?;
+        self.create_root()?;
+        let p = self.to_absolute(path)?;
         //println!("Creating {:?}", p);
         fs::DirBuilder::new()
             .recursive(true)
@@ -282,13 +301,15 @@ impl VFS for PhysicalFS {
     }
 
     /// Remove a file
-    fn rm(&self, path: &Path) -> GameResult<()> {
+    fn rm(&self, path: &Path) -> GameResult {
         if self.readonly {
-            return Err(GameError::FilesystemError("Tried to remove file {} but FS is read-only"
-                                                      .to_string()));
+            return Err(GameError::FilesystemError(
+                "Tried to remove file {} but FS is read-only".to_string(),
+            ));
         }
 
-        let p = self.get_absolute(path)?;
+        self.create_root()?;
+        let p = self.to_absolute(path)?;
         if p.is_dir() {
             fs::remove_dir(p).map_err(GameError::from)
         } else {
@@ -297,14 +318,17 @@ impl VFS for PhysicalFS {
     }
 
     /// Remove a file or directory and all its contents
-    fn rmrf(&self, path: &Path) -> GameResult<()> {
+    fn rmrf(&self, path: &Path) -> GameResult {
         if self.readonly {
-            return Err(GameError::FilesystemError("Tried to remove file/dir {} but FS is \
-                                                   read-only"
-                                                          .to_string()));
+            return Err(GameError::FilesystemError(
+                "Tried to remove file/dir {} but FS is \
+                 read-only"
+                    .to_string(),
+            ));
         }
 
-        let p = self.get_absolute(path)?;
+        self.create_root()?;
+        let p = self.to_absolute(path)?;
         if p.is_dir() {
             fs::remove_dir_all(p).map_err(GameError::from)
         } else {
@@ -314,32 +338,37 @@ impl VFS for PhysicalFS {
 
     /// Check if the file exists
     fn exists(&self, path: &Path) -> bool {
-        match self.get_absolute(path) {
+        match self.to_absolute(path) {
             Ok(p) => p.exists(),
             _ => false,
         }
     }
 
     /// Get the file's metadata
-    fn metadata(&self, path: &Path) -> GameResult<Box<VMetadata>> {
-        let p = self.get_absolute(path)?;
+    fn metadata(&self, path: &Path) -> GameResult<Box<dyn VMetadata>> {
+        self.create_root()?;
+        let p = self.to_absolute(path)?;
         p.metadata()
-            .map(|m| Box::new(PhysicalMetadata(m)) as Box<VMetadata>)
+            .map(|m| Box::new(PhysicalMetadata(m)) as Box<dyn VMetadata>)
             .map_err(GameError::from)
     }
 
     /// Retrieve the path entries in this path
-    fn read_dir(&self, path: &Path) -> GameResult<Box<Iterator<Item = GameResult<PathBuf>>>> {
-        let p = self.get_absolute(path)?;
+    fn read_dir(&self, path: &Path) -> GameResult<Box<dyn Iterator<Item = GameResult<PathBuf>>>> {
+        self.create_root()?;
+        let p = self.to_absolute(path)?;
         // This is inconvenient because path() returns the full absolute
         // path of the bloody file, which is NOT what we want!
         // But if we use file_name() to just get the name then it is ALSO not what we want!
         // what we WANT is the full absolute file path, *relative to the resources dir*.
-        // So that we can do read_dir("/foobar/"), and for each file, open it and query 
+        // So that we can do read_dir("/foobar/"), and for each file, open it and query
         // it and such by name.
         // So we build the paths ourself.
         let direntry_to_path = |entry: &fs::DirEntry| -> GameResult<PathBuf> {
-            let fname = entry.file_name().into_string().unwrap();
+            let fname = entry
+                .file_name()
+                .into_string()
+                .expect("Non-unicode char in file path?  Should never happen, I hope!");
             let mut pathbuf = PathBuf::from(path);
             pathbuf.push(fname);
             Ok(pathbuf)
@@ -360,44 +389,48 @@ impl VFS for PhysicalFS {
 /// A structure that joins several VFS's together in order.
 #[derive(Debug)]
 pub struct OverlayFS {
-    roots: VecDeque<Box<VFS>>,
+    roots: VecDeque<Box<dyn VFS>>,
 }
 
 impl OverlayFS {
     pub fn new() -> Self {
-        Self { roots: VecDeque::new() }
+        Self {
+            roots: VecDeque::new(),
+        }
     }
 
     /// Adds a new VFS to the front of the list.
     /// Currently unused, I suppose, but good to
     /// have at least for tests.
     #[allow(dead_code)]
-    pub fn push_front(&mut self, fs: Box<VFS>) {
+    pub fn push_front(&mut self, fs: Box<dyn VFS>) {
         self.roots.push_front(fs);
     }
 
     /// Adds a new VFS to the end of the list.
-    pub fn push_back(&mut self, fs: Box<VFS>) {
+    pub fn push_back(&mut self, fs: Box<dyn VFS>) {
         self.roots.push_back(fs);
     }
 
-    pub fn roots(&self) -> &VecDeque<Box<VFS>> {
+    pub fn roots(&self) -> &VecDeque<Box<dyn VFS>> {
         &self.roots
     }
 }
 
 impl VFS for OverlayFS {
     /// Open the file at this path with the given options
-    fn open_options(&self, path: &Path, open_options: &OpenOptions) -> GameResult<Box<VFile>> {
-        let mut tried: Vec<PathBuf> = vec![];
+    fn open_options(&self, path: &Path, open_options: &OpenOptions) -> GameResult<Box<dyn VFile>> {
+        let mut tried: Vec<(PathBuf, GameError)> = vec![];
 
         for vfs in &self.roots {
             match vfs.open_options(path, open_options) {
-                Err(_) => {
+                Err(e) => {
                     if let Some(vfs_path) = vfs.to_path_buf() {
-                        tried.push(vfs_path);
+                        tried.push((vfs_path, e));
+                    } else {
+                        tried.push((PathBuf::from("<invalid path>"), e));
                     }
-                },
+                }
                 f => return f,
             }
         }
@@ -406,37 +439,45 @@ impl VFS for OverlayFS {
     }
 
     /// Create a directory at the location by this path
-    fn mkdir(&self, path: &Path) -> GameResult<()> {
+    fn mkdir(&self, path: &Path) -> GameResult {
         for vfs in &self.roots {
             match vfs.mkdir(path) {
                 Err(_) => (),
                 f => return f,
             }
         }
-        Err(GameError::FilesystemError(format!("Could not find anywhere writeable to make dir {:?}",
-                                               path)))
+        Err(GameError::FilesystemError(format!(
+            "Could not find anywhere writeable to make dir {:?}",
+            path
+        )))
     }
 
     /// Remove a file
-    fn rm(&self, path: &Path) -> GameResult<()> {
+    fn rm(&self, path: &Path) -> GameResult {
         for vfs in &self.roots {
             match vfs.rm(path) {
                 Err(_) => (),
                 f => return f,
             }
         }
-        Err(GameError::FilesystemError(format!("Could not remove file {:?}", path)))
+        Err(GameError::FilesystemError(format!(
+            "Could not remove file {:?}",
+            path
+        )))
     }
 
     /// Remove a file or directory and all its contents
-    fn rmrf(&self, path: &Path) -> GameResult<()> {
+    fn rmrf(&self, path: &Path) -> GameResult {
         for vfs in &self.roots {
             match vfs.rmrf(path) {
                 Err(_) => (),
                 f => return f,
             }
         }
-        Err(GameError::FilesystemError(format!("Could not remove file/dir {:?}", path)))
+        Err(GameError::FilesystemError(format!(
+            "Could not remove file/dir {:?}",
+            path
+        )))
     }
 
     /// Check if the file exists
@@ -451,18 +492,21 @@ impl VFS for OverlayFS {
     }
 
     /// Get the file's metadata
-    fn metadata(&self, path: &Path) -> GameResult<Box<VMetadata>> {
+    fn metadata(&self, path: &Path) -> GameResult<Box<dyn VMetadata>> {
         for vfs in &self.roots {
             match vfs.metadata(path) {
                 Err(_) => (),
                 f => return f,
             }
         }
-        Err(GameError::FilesystemError(format!("Could not get metadata for file/dir {:?}", path)))
+        Err(GameError::FilesystemError(format!(
+            "Could not get metadata for file/dir {:?}",
+            path
+        )))
     }
 
     /// Retrieve the path entries in this path
-    fn read_dir(&self, path: &Path) -> GameResult<Box<Iterator<Item = GameResult<PathBuf>>>> {
+    fn read_dir(&self, path: &Path) -> GameResult<Box<dyn Iterator<Item = GameResult<PathBuf>>>> {
         // This is tricky 'cause we have to actually merge iterators together...
         // Doing it the simple and stupid way works though.
         let mut v = Vec::new();
@@ -490,7 +534,7 @@ pub struct ZipFS {
     //
     // ALSO THE SEMANTICS OF ZIPARCHIVE AND HAVING ZIPFILES BORROW IT IS
     // HORRIFICALLY BROKEN BY DESIGN SO WE'RE JUST GONNA REFCELL IT AND COPY
-    // ALL CONTENTS OUT OF IT.
+    // ALL CONTENTS OUT OF IT AAAAA.
     source: PathBuf,
     archive: RefCell<zip::ZipArchive<fs::File>>,
     // We keep an index of what files are in the zip file
@@ -503,7 +547,13 @@ impl ZipFS {
         let f = fs::File::open(filename)?;
         let mut archive = zip::ZipArchive::new(f)?;
         let idx = (0..archive.len())
-            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .map(|i| {
+                archive
+                    .by_index(i)
+                    .expect("Should never happen!")
+                    .name()
+                    .to_string()
+            })
             .collect();
         Ok(Self {
             source: filename.into(),
@@ -530,8 +580,10 @@ pub struct ZipFileWrapper {
 impl ZipFileWrapper {
     fn new(z: &mut zip::read::ZipFile) -> GameResult<Self> {
         let mut b = Vec::new();
-        z.read_to_end(&mut b)?;
-        Ok(Self { buffer: io::Cursor::new(b) })
+        let _ = z.read_to_end(&mut b)?;
+        Ok(Self {
+            buffer: io::Cursor::new(b),
+        })
     }
 }
 
@@ -540,7 +592,6 @@ impl io::Read for ZipFileWrapper {
         self.buffer.read(buf)
     }
 }
-
 
 impl io::Write for ZipFileWrapper {
     fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
@@ -564,7 +615,6 @@ impl Debug for ZipFileWrapper {
     }
 }
 
-
 #[derive(Debug, Copy, Clone, PartialEq)]
 struct ZipMetadata {
     len: u64,
@@ -580,17 +630,18 @@ impl ZipMetadata {
     ///
     /// This does make listing a directory rather screwy.
     fn new<T>(name: &str, archive: &mut zip::ZipArchive<T>) -> Option<Self>
-        where T: io::Read + io::Seek
+    where
+        T: io::Read + io::Seek,
     {
         match archive.by_name(name) {
             Err(_) => None,
             Ok(zipfile) => {
                 let len = zipfile.size();
                 Some(ZipMetadata {
-                         len: len,
-                         is_file: true,
-                         is_dir: false, // mu
-                     })
+                    len,
+                    is_file: true,
+                    is_dir: false, // mu
+                })
             }
         }
     }
@@ -608,16 +659,16 @@ impl VMetadata for ZipMetadata {
     }
 }
 
-
 impl VFS for ZipFS {
-    fn open_options(&self, path: &Path, open_options: &OpenOptions) -> GameResult<Box<VFile>> {
+    fn open_options(&self, path: &Path, open_options: &OpenOptions) -> GameResult<Box<dyn VFile>> {
         // Zip is readonly
         let path = convenient_path_to_str(path)?;
-        if open_options.write || open_options.create || open_options.append ||
-           open_options.truncate {
-            let msg = format!("Cannot alter file {:?} in zipfile {:?}, filesystem read-only",
-                              path,
-                              self);
+        if open_options.write || open_options.create || open_options.append || open_options.truncate
+        {
+            let msg = format!(
+                "Cannot alter file {:?} in zipfile {:?}, filesystem read-only",
+                path, self
+            );
             return Err(GameError::FilesystemError(msg));
         }
         let mut stupid_archive_borrow = self.archive
@@ -625,28 +676,30 @@ impl VFS for ZipFS {
             .expect("Couldn't borrow ZipArchive in ZipFS::open_options(); should never happen! Report a bug at https://github.com/ggez/ggez/");
         let mut f = stupid_archive_borrow.by_name(path)?;
         let zipfile = ZipFileWrapper::new(&mut f)?;
-        Ok(Box::new(zipfile) as Box<VFile>)
+        Ok(Box::new(zipfile) as Box<dyn VFile>)
     }
 
-    fn mkdir(&self, path: &Path) -> GameResult<()> {
-        let msg = format!("Cannot mkdir {:?} in zipfile {:?}, filesystem read-only",
-                          path,
-                          self);
-        Err(GameError::FilesystemError(msg))
-
-    }
-
-    fn rm(&self, path: &Path) -> GameResult<()> {
-        let msg = format!("Cannot rm {:?} in zipfile {:?}, filesystem read-only",
-                          path,
-                          self);
+    fn mkdir(&self, path: &Path) -> GameResult {
+        let msg = format!(
+            "Cannot mkdir {:?} in zipfile {:?}, filesystem read-only",
+            path, self
+        );
         Err(GameError::FilesystemError(msg))
     }
 
-    fn rmrf(&self, path: &Path) -> GameResult<()> {
-        let msg = format!("Cannot rmrf {:?} in zipfile {:?}, filesystem read-only",
-                          path,
-                          self);
+    fn rm(&self, path: &Path) -> GameResult {
+        let msg = format!(
+            "Cannot rm {:?} in zipfile {:?}, filesystem read-only",
+            path, self
+        );
+        Err(GameError::FilesystemError(msg))
+    }
+
+    fn rmrf(&self, path: &Path) -> GameResult {
+        let msg = format!(
+            "Cannot rmrf {:?} in zipfile {:?}, filesystem read-only",
+            path, self
+        );
         Err(GameError::FilesystemError(msg))
     }
 
@@ -661,26 +714,27 @@ impl VFS for ZipFS {
         }
     }
 
-    fn metadata(&self, path: &Path) -> GameResult<Box<VMetadata>> {
+    fn metadata(&self, path: &Path) -> GameResult<Box<dyn VMetadata>> {
         let path = convenient_path_to_str(path)?;
-        let mut stupid_archive_borrow =
-            self.archive
-                .try_borrow_mut()
-                .expect("Couldn't borrow ZipArchive in ZipFS::metadata(); should never happen! Report a bug at https://github.com/ggez/ggez/");
+        let mut stupid_archive_borrow = self.archive
+            .try_borrow_mut()
+            .expect("Couldn't borrow ZipArchive in ZipFS::metadata(); should never happen! Report a bug at https://github.com/ggez/ggez/");
         match ZipMetadata::new(path, &mut stupid_archive_borrow) {
-            None => {
-                Err(GameError::FilesystemError(format!("Metadata not found in zip file for {}",
-                                                       path)))
-            }
-            Some(md) => Ok(Box::new(md) as Box<VMetadata>),
+            None => Err(GameError::FilesystemError(format!(
+                "Metadata not found in zip file for {}",
+                path
+            ))),
+            Some(md) => Ok(Box::new(md) as Box<dyn VMetadata>),
         }
     }
 
     /// Zip files don't have real directories, so we (incorrectly) hack it by
     /// just looking for a path prefix for now.
-    fn read_dir(&self, path: &Path) -> GameResult<Box<Iterator<Item = GameResult<PathBuf>>>> {
+    fn read_dir(&self, path: &Path) -> GameResult<Box<dyn Iterator<Item = GameResult<PathBuf>>>> {
         let path = convenient_path_to_str(path)?;
-        let itr = self.index.iter()
+        let itr = self
+            .index
+            .iter()
             .filter(|s| s.starts_with(path))
             .map(|s| Ok(PathBuf::from(s)))
             .collect::<Vec<_>>();
@@ -694,23 +748,25 @@ impl VFS for ZipFS {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{self, BufRead};
     use super::*;
+    use std::io::{self, BufRead};
 
     #[test]
-    fn test_path_filtering() {
+    fn headless_test_path_filtering() {
+        // Valid pahts
         let p = path::Path::new("/foo");
-        sanitize_path(p).unwrap();
+        assert!(sanitize_path(p).is_some());
 
         let p = path::Path::new("/foo/");
-        sanitize_path(p).unwrap();
+        assert!(sanitize_path(p).is_some());
 
         let p = path::Path::new("/foo/bar.txt");
-        sanitize_path(p).unwrap();
+        assert!(sanitize_path(p).is_some());
 
         let p = path::Path::new("/");
-        sanitize_path(p).unwrap();
+        assert!(sanitize_path(p).is_some());
 
+        // Invalid paths
         let p = path::Path::new("../foo");
         assert!(sanitize_path(p).is_none());
 
@@ -731,18 +787,21 @@ mod tests {
     }
 
     #[test]
-    fn test_read() {
+    fn headless_test_read() {
         let cargo_path = Path::new(env!("CARGO_MANIFEST_DIR"));
         let fs = PhysicalFS::new(cargo_path, true);
         let f = fs.open(Path::new("/Cargo.toml")).unwrap();
         let mut bf = io::BufReader::new(f);
         let mut s = String::new();
-        bf.read_line(&mut s).unwrap();
-        assert_eq!(&s, "[package]\n");
+        let _ = bf.read_line(&mut s).unwrap();
+        // Trim whitespace from string 'cause it will
+        // potentially be different on Windows and Unix.
+        let trimmed_string = s.trim();
+        assert_eq!(trimmed_string, "[package]");
     }
 
     #[test]
-    fn test_read_overlay() {
+    fn headless_test_read_overlay() {
         let cargo_path = Path::new(env!("CARGO_MANIFEST_DIR"));
         let fs1 = PhysicalFS::new(cargo_path, true);
         let mut f2path = PathBuf::from(cargo_path);
@@ -758,7 +817,7 @@ mod tests {
     }
 
     #[test]
-    fn test_physical_all() {
+    fn headless_test_physical_all() {
         let cargo_path = Path::new(env!("CARGO_MANIFEST_DIR"));
         let fs = PhysicalFS::new(cargo_path, false);
         let testdir = Path::new("/testdir");
@@ -780,12 +839,12 @@ mod tests {
         fs.mkdir(testdir).unwrap();
         {
             let mut f = fs.append(f1).unwrap();
-            f.write(test_string.as_bytes()).unwrap();
+            let _ = f.write(test_string.as_bytes()).unwrap();
         }
         {
             let mut buf = Vec::new();
             let mut f = fs.open(f1).unwrap();
-            f.read_to_end(&mut buf).unwrap();
+            let _ = f.read_to_end(&mut buf).unwrap();
             assert_eq!(&buf[..], test_string.as_bytes());
         }
 
@@ -818,7 +877,7 @@ mod tests {
                 assert!(fs.exists(&fname));
             }
         }
-        
+
         {
             assert!(fs.exists(f1));
             fs.rm(f1).unwrap();
@@ -828,7 +887,6 @@ mod tests {
         fs.rmrf(testdir).unwrap();
         assert!(!fs.exists(testdir));
     }
-
 
     // BUGGO: TODO: Make sure all functions are tested for OverlayFS and ZipFS!!
 }
